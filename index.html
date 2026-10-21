@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>room-lens — ASCII room mapper (v1)</title>
+<title>room-lens — ASCII room mapper (v1.1)</title>
 <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { width: 100%; min-height: 100%; background: #050505; color: #c8ffc8;
@@ -25,6 +25,8 @@
     button:disabled { opacity: 0.35; }
     #btn-stop { color: #ff6666; border-color: #4d2e2e; background: #1f0d0d; }
     #btn-walk.on { background: #14532d; color: #bbf7d0; border-color: #22c55e; }
+    #btn-rir.on { background: #14532d; color: #bbf7d0; border-color: #22c55e; }
+    #upload-result { padding: 0 14px 8px; font-size: 12px; line-height: 1.5; color: #9fe89f; white-space: pre-wrap; word-break: break-all; }
     #err { padding: 0 14px 10px; font-size: 12px; color: #ff8888; }
     footer { padding: 4px 14px 16px; font-size: 11px; color: #5c6b5c; line-height: 1.5; }
 </style>
@@ -32,24 +34,27 @@
 <body>
 
 <header>
-    <h1>ROOM-LENS v1</h1>
-    <p>Live ASCII room mapper. Renderer lifted from SuperInstance/chiaroscuro (Mirror door + Sobel shape layer). Adaptive fidelity: still = finer grid, moving = faster/coarser. Walkabout banks ASCII frames + pose stamps for the splat lane.</p>
+    <h1>ROOM-LENS v1.1</h1>
+    <p>Live ASCII room mapper. Renderer lifted from SuperInstance/chiaroscuro (Mirror door + Sobel shape layer). Adaptive fidelity: still = finer grid, moving = faster/coarser. Walkabout banks ASCII frames + pose stamps + microphone audio on one clock for the splat lane. MEASURE ROOM records a swept-sine for RT60. Bundles download — or upload straight to the fleet.</p>
 </header>
 
 <div id="stage"><canvas id="ascii-canvas"></canvas></div>
-<div id="status">idle — tap START CAMERA. Nothing is sent anywhere; everything stays on this phone until you download a bundle.</div>
+<div id="status">idle — tap START CAMERA. Camera and mic are requested together; if the mic is refused, the page says so and runs video-only. Nothing leaves this phone unless you tap UPLOAD BUNDLE or download the bundle file yourself.</div>
 
 <div id="controls">
     <button id="btn-start">▶ START CAMERA</button>
     <button id="btn-walk" disabled>● START WALKABOUT</button>
+    <button id="btn-rir" disabled>≋ MEASURE ROOM (30s) · EXPERIMENTAL</button>
     <button id="btn-bundle" disabled>↓ DOWNLOAD BUNDLE</button>
+    <button id="btn-upload" disabled>⇪ UPLOAD BUNDLE</button>
     <button id="btn-stop" disabled>■ STOP</button>
 </div>
+<div id="upload-result"></div>
 <div id="err"></div>
 
 <footer>
     Honest status only: the line above reports measured fps, grid tier and banked frames — no fake progress.
-    Bundle = one JSON file: timestamped ASCII frames, device-orientation pose stamps, and a JPEG keyframe every 5th frame.
+    Bundle = one JSON file: timestamped ASCII frames, device-orientation pose stamps, a JPEG keyframe every 5th frame, walkabout audio (opus/webm) banked on the same session clock, and any room-measure swept-sine recordings (experimental, for RT60). UPLOAD BUNDLE posts that same JSON to the room-lens-upload worker (R2 bucket room-lens-bundles) and shows the fetch URL.
 </footer>
 
 <script>
@@ -82,6 +87,10 @@ var btnStart = document.getElementById('btn-start');
 var btnWalk = document.getElementById('btn-walk');
 var btnBundle = document.getElementById('btn-bundle');
 var btnStop = document.getElementById('btn-stop');
+var btnRir = document.getElementById('btn-rir');
+var btnUpload = document.getElementById('btn-upload');
+var uploadEl = document.getElementById('upload-result');
+var UPLOAD_URL = 'https://room-lens-upload.casey-digennaro.workers.dev/upload';
 
 /* ---------------- adaptive fidelity tiers ----------------
    still  -> finer grid, low fps (detail harvest)
@@ -129,7 +138,7 @@ var prevLuma = null;
 
 /* walkabout banking */
 var walking = false, walkStart = 0, lastBankAt = 0;
-var bank = { frames: [], keyframes: [] };
+var bank = { frames: [], keyframes: [], rirMeasures: [] };
 var sessionMeta = null;
 
 function setErr(msg) { errEl.textContent = msg || ''; }
@@ -295,13 +304,230 @@ function updateStatus(tier, cols, rows) {
     if (now - statusTick < 500) return;
     statusTick = now;
     var poseTxt = poseLive ? 'pose: live' : 'pose: none (frames only)';
+    var audioTxt = audioOn
+        ? ('audio: ON' + ((micRecorder && micRecorder.state === 'recording') ? ' · banking ' + Math.round(audioBytes / 1024) + ' KB' : ''))
+        : ('audio: OFF (' + audioWhyOff + ')');
     var walkTxt = walking ? (' · WALKABOUT banking: ' + bank.frames.length + ' frames, ' +
                              bank.keyframes.length + ' keyframes, ' +
                              Math.round((Date.now() - walkStart) / 1000) + 's') : '';
     statusEl.textContent = 'LIVE · ' + fpsMeasured.toFixed(1) + ' fps · tier ' + tier.name +
         ' · grid ' + cols + 'x' + rows + ' · motion ' + motionScore.toFixed(2) +
-        ' · ' + poseTxt + walkTxt;
+        ' · ' + poseTxt + ' · ' + audioTxt + walkTxt;
 }
+
+
+/* ---------------- v1.1: audio banking, room measure, upload ----------------
+   Audio is requested in the same START gesture as the camera (raw chain:
+   echoCancellation / noiseSuppression / autoGainControl all off, so the
+   room is measured, not processed). The walkabout recorder starts inside
+   the walkabout, so audio and frames share the phone clock; meta.audio
+   carries the start timestamp + offset + drift note for the splat lane. */
+var audioOn = false, audioWhyOff = '';
+var micRecorder = null, micChunks = [], micMime = '', audioBytes = 0, audioStartT = 0;
+var audioData = null; /* { mimeType, base64, bytes, startedAt, offsetMs } after a walkabout */
+
+function pickMime() {
+    var cands = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', ''];
+    for (var i = 0; i < cands.length; i++) {
+        if (!cands[i]) return '';
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(cands[i])) return cands[i];
+    }
+    return '';
+}
+
+function blobToBase64(blob) {
+    return new Promise(function (resolve, reject) {
+        var r = new FileReader();
+        r.onload = function () { var s2 = String(r.result); resolve(s2.slice(s2.indexOf(',') + 1)); };
+        r.onerror = reject;
+        r.readAsDataURL(blob);
+    });
+}
+
+function startMicRecorder() {
+    micChunks = []; audioBytes = 0;
+    if (!audioOn || !stream || typeof MediaRecorder === 'undefined') return false;
+    try {
+        var tracks = stream.getAudioTracks();
+        if (!tracks.length) return false;
+        micMime = pickMime();
+        micRecorder = micMime ? new MediaRecorder(new MediaStream(tracks), { mimeType: micMime })
+                              : new MediaRecorder(new MediaStream(tracks));
+        micRecorder.ondataavailable = function (e) {
+            if (e.data && e.data.size) { micChunks.push(e.data); audioBytes += e.data.size; }
+        };
+        audioStartT = Date.now();
+        micRecorder.start(1000);
+        return true;
+    } catch (e) { return false; }
+}
+
+function stopMicRecorder() {
+    return new Promise(function (resolve) {
+        if (!micRecorder || micRecorder.state === 'inactive') { resolve(null); return; }
+        micRecorder.onstop = function () {
+            var blob = new Blob(micChunks, { type: micMime || 'audio/webm' });
+            blobToBase64(blob).then(function (b64) {
+                audioData = { mimeType: blob.type, base64: b64, bytes: blob.size,
+                              startedAt: new Date(audioStartT).toISOString(),
+                              offsetMs: audioStartT - walkStart };
+                resolve(audioData);
+            }).catch(function () { resolve(null); });
+        };
+        try { micRecorder.stop(); } catch (e) { resolve(null); }
+    });
+}
+
+function genSessionId() {
+    return 'roomlens-' + new Date().toISOString().replace(/[:.]/g, '-') +
+           '-' + Math.random().toString(36).slice(2, 8);
+}
+
+function ensureSession(force) {
+    var empty = bank.frames.length === 0 && (bank.rirMeasures || []).length === 0 && !audioData;
+    if (!sessionMeta || (force && empty)) {
+        sessionMeta = { kind: 'room-lens-session', version: 2, sessionId: genSessionId(),
+                        startedAt: new Date().toISOString(), userAgent: navigator.userAgent };
+    }
+    return sessionMeta;
+}
+
+function buildBundle() {
+    ensureSession(false);
+    var meta = {};
+    for (var k in sessionMeta) meta[k] = sessionMeta[k];
+    meta.audio = audioData
+        ? { present: true, startedAt: audioData.startedAt, offsetMs: audioData.offsetMs,
+            mimeType: audioData.mimeType, bytes: audioData.bytes,
+            driftNote: 'single device: mic and camera share the phone clock and the recorder starts inside the same walkabout (offsetMs = audio start minus session start); no cross-device drift term applies.' }
+        : { present: false, reason: audioWhyOff || 'audio not recorded' };
+    var b = { meta: meta, endedAt: new Date().toISOString(),
+              frames: bank.frames, keyframes: bank.keyframes, rirMeasures: bank.rirMeasures || [] };
+    if (audioData) b.audio = { mimeType: audioData.mimeType, base64: audioData.base64 };
+    return b;
+}
+
+/* ---- MEASURE ROOM: swept-sine RIR capture (experimental) ----
+   Plays a 20 s log sweep 20 Hz -> 16 kHz at gain 0.4 through the phone
+   speaker while a dedicated recorder listens on the same mic; 4 s of
+   tail captures the decay. The banked asset is the raw recording the
+   splat lane deconvolves into an impulse response / RT60. */
+var measuring = false, measureCtx = null, measureSrc = null, measureRec = null;
+var measureChunks = [], measureCancel = false, measureTickInt = null, measureStartT = 0;
+
+function cancelMeasure() {
+    measureCancel = true;
+    if (measureTickInt) { clearInterval(measureTickInt); measureTickInt = null; }
+    if (measureSrc) { try { measureSrc.stop(); } catch (e) {} measureSrc = null; }
+    if (measureRec && measureRec.state !== 'inactive') { try { measureRec.stop(); } catch (e) {} }
+    if (measureCtx) { try { measureCtx.close(); } catch (e) {} measureCtx = null; }
+    measuring = false; btnRir.classList.remove('on'); btnRir.disabled = !audioOn;
+}
+
+btnRir.addEventListener('click', function () {
+    if (measuring || !running) return;
+    if (!audioOn) { setErr('MEASURE ROOM needs the microphone — audio is OFF (' + audioWhyOff + ').'); return; }
+    setErr('');
+    ensureSession(false);
+    measuring = true; measureCancel = false;
+    btnRir.disabled = true; btnRir.classList.add('on');
+    var AC = window.AudioContext || window.webkitAudioContext;
+    measureCtx = new AC();
+    if (measureCtx.state === 'suspended') measureCtx.resume();
+    var sr = measureCtx.sampleRate;
+    var sweepS = 20, tailS = 4, f0 = 20, f1 = 16000, gainLvl = 0.4;
+    var len = Math.floor(sr * sweepS);
+    var buffer = measureCtx.createBuffer(1, len, sr);
+    var chd = buffer.getChannelData(0);
+    var kk = Math.log(f1 / f0), fade = Math.max(1, Math.floor(sr * 0.05));
+    for (var i = 0; i < len; i++) {
+        var t = i / sr;
+        var ph = 2 * Math.PI * f0 * sweepS / kk * (Math.exp(kk * t / sweepS) - 1);
+        var env = Math.min(1, Math.min(i, len - i) / fade);
+        chd[i] = env * Math.sin(ph);
+    }
+    measureChunks = [];
+    var mt = pickMime();
+    try {
+        measureRec = mt ? new MediaRecorder(new MediaStream(stream.getAudioTracks()), { mimeType: mt })
+                        : new MediaRecorder(new MediaStream(stream.getAudioTracks()));
+    } catch (e) {
+        setErr('Room measure failed: recorder unavailable (' + e.message + ')');
+        measuring = false; btnRir.disabled = false; btnRir.classList.remove('on');
+        if (measureCtx) { try { measureCtx.close(); } catch (e2) {} measureCtx = null; }
+        return;
+    }
+    var recMime = measureRec.mimeType || mt || 'audio/webm';
+    measureRec.ondataavailable = function (e) { if (e.data && e.data.size) measureChunks.push(e.data); };
+    measureStartT = Date.now();
+    measureRec.onstop = function () {
+        if (measureTickInt) { clearInterval(measureTickInt); measureTickInt = null; }
+        if (measureCtx) { try { measureCtx.close(); } catch (e) {} measureCtx = null; }
+        measuring = false; btnRir.classList.remove('on'); btnRir.disabled = !audioOn;
+        if (measureCancel) { statusEl.textContent = 'room measure cancelled — nothing banked.'; return; }
+        var blob = new Blob(measureChunks, { type: recMime });
+        blobToBase64(blob).then(function (b64) {
+            bank.rirMeasures.push({ kind: 'rir-sweep',
+                t: walking ? (measureStartT - walkStart) : null,
+                startedAt: new Date(measureStartT).toISOString(),
+                sweep: { type: 'log', f0: f0, f1: f1, sweepS: sweepS, tailS: tailS, gain: gainLvl },
+                mimeType: recMime, bytes: blob.size, base64: b64 });
+            btnBundle.disabled = false; btnUpload.disabled = false;
+            statusEl.textContent = 'ROOM MEASURE banked — swept-sine recording (' + Math.round(blob.size / 1024) +
+                ' KB) is in the bundle for RT60 analysis. Experimental: one position, modest level.';
+        });
+    };
+    measureRec.start(500);
+    setTimeout(function () {
+        if (measureCancel || !measureCtx) return;
+        measureSrc = measureCtx.createBufferSource();
+        measureSrc.buffer = buffer;
+        var g = measureCtx.createGain(); g.gain.value = gainLvl;
+        measureSrc.connect(g); g.connect(measureCtx.destination);
+        measureSrc.start();
+    }, 150);
+    var tEnd = Date.now() + (sweepS + tailS) * 1000 + 400;
+    measureTickInt = setInterval(function () {
+        var left = Math.max(0, Math.round((tEnd - Date.now()) / 1000));
+        statusEl.textContent = 'MEASURING ROOM — swept sine playing (experimental, modest level). Keep the room quiet… ' + left + 's';
+        if (left <= 0) {
+            clearInterval(measureTickInt); measureTickInt = null;
+            if (measureRec && measureRec.state !== 'inactive') { try { measureRec.stop(); } catch (e) {} }
+        }
+    }, 500);
+});
+
+/* ---- UPLOAD BUNDLE: POST the same JSON the download saves ---- */
+btnUpload.addEventListener('click', function () {
+    var payload = JSON.stringify(buildBundle());
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', UPLOAD_URL, true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    btnUpload.disabled = true;
+    setErr('');
+    xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable) {
+            statusEl.textContent = 'uploading bundle… ' + Math.round(100 * e.loaded / e.total) +
+                '% of ' + (e.total / 1048576).toFixed(2) + ' MB';
+        }
+    };
+    xhr.onload = function () {
+        btnUpload.disabled = false;
+        var r = null;
+        try { r = JSON.parse(xhr.responseText); } catch (e) { /* handled below */ }
+        if (xhr.status >= 200 && xhr.status < 300 && r && r.ok) {
+            uploadEl.textContent = 'UPLOADED ✓ session ' + r.sessionId + ' (' + (r.bytes / 1048576).toFixed(2) + ' MB stored)\nfetch: ' + r.fetch;
+            statusEl.textContent = 'upload complete — the fleet can fetch session ' + r.sessionId + ' now.';
+        } else {
+            setErr('Upload failed: HTTP ' + xhr.status + ' ' + String(xhr.responseText).slice(0, 200) + ' — DOWNLOAD BUNDLE still works.');
+        }
+    };
+    xhr.onerror = function () {
+        btnUpload.disabled = false;
+        setErr('Upload network error — the bundle is still on this page; DOWNLOAD BUNDLE still works.');
+    };
+    xhr.send(payload);
+});
 
 /* ---------------- controls ---------------- */
 function askOrientationPermission() {
@@ -317,13 +543,22 @@ function askOrientationPermission() {
 btnStart.addEventListener('click', function () {
     setErr('');
     askOrientationPermission().then(function () {
-        return navigator.mediaDevices.getUserMedia({
-            video: { facingMode: { ideal: 'environment' },
-                     width: { ideal: 1280 }, height: { ideal: 720 } },
-            audio: false
+        var vid = { facingMode: { ideal: 'environment' },
+                    width: { ideal: 1280 }, height: { ideal: 720 } };
+        var aud = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+        return navigator.mediaDevices.getUserMedia({ video: vid, audio: aud })
+        .catch(function (e) {
+            /* mic (or cam) refused: retry video-only in the same gesture; the status line says audio is OFF */
+            audioWhyOff = e.name + ': ' + e.message;
+            return navigator.mediaDevices.getUserMedia({ video: vid, audio: false });
         });
     }).then(function (s) {
         stream = s;
+        audioOn = s.getAudioTracks().length > 0;
+        if (audioOn && typeof MediaRecorder === 'undefined') {
+            audioOn = false; audioWhyOff = 'MediaRecorder not supported in this browser';
+        }
+        if (!audioOn && !audioWhyOff) audioWhyOff = 'no audio track returned';
         video.srcObject = s;
         return video.play();
     }).then(function () {
@@ -331,6 +566,7 @@ btnStart.addEventListener('click', function () {
         tierSince = performance.now();
         lastFrameAt = 0; fpsWindowT = performance.now(); fpsWindowN = 0;
         btnStart.disabled = true; btnWalk.disabled = false; btnStop.disabled = false;
+        btnRir.disabled = !audioOn;
         requestAnimationFrame(render);
     }).catch(function (e) {
         setErr('Camera failed: ' + e.name + ' — ' + e.message + ' (needs HTTPS + camera permission).');
@@ -341,25 +577,33 @@ btnStart.addEventListener('click', function () {
 btnWalk.addEventListener('click', function () {
     if (!walking) {
         walking = true; walkStart = Date.now(); lastBankAt = 0;
-        bank = { frames: [], keyframes: [] };
-        sessionMeta = { kind: 'room-lens-session', version: 1,
-                        startedAt: new Date(walkStart).toISOString(),
-                        userAgent: navigator.userAgent };
+        bank = { frames: [], keyframes: [], rirMeasures: bank.rirMeasures || [] };
+        audioData = null;
+        ensureSession(true);
+        startMicRecorder();
         btnWalk.textContent = '■ STOP WALKABOUT';
         btnWalk.classList.add('on');
         btnBundle.disabled = true;
+        btnUpload.disabled = true;
     } else {
         walking = false;
         btnWalk.textContent = '● START WALKABOUT';
         btnWalk.classList.remove('on');
-        btnBundle.disabled = bank.frames.length === 0;
-        statusEl.textContent = 'walkabout stopped — ' + bank.frames.length + ' frames banked. Tap DOWNLOAD BUNDLE to save the session file.';
+        statusEl.textContent = 'walkabout stopped — finalising audio…';
+        stopMicRecorder().then(function () {
+            var has = bank.frames.length > 0 || !!audioData || (bank.rirMeasures || []).length > 0;
+            btnBundle.disabled = !has;
+            btnUpload.disabled = !has;
+            statusEl.textContent = 'walkabout stopped — ' + bank.frames.length + ' frames banked' +
+                (audioData ? ', audio ' + Math.round(audioData.bytes / 1024) + ' KB on the session clock'
+                           : ', NO audio (' + audioWhyOff + ')') +
+                '. DOWNLOAD or UPLOAD the bundle.';
+        });
     }
 });
 
 btnBundle.addEventListener('click', function () {
-    var bundle = { meta: sessionMeta, endedAt: new Date().toISOString(),
-                   frames: bank.frames, keyframes: bank.keyframes };
+    var bundle = buildBundle();
     var blob = new Blob([JSON.stringify(bundle)], { type: 'application/json' });
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -370,8 +614,10 @@ btnBundle.addEventListener('click', function () {
 
 btnStop.addEventListener('click', function () {
     running = false; walking = false;
+    if (measuring) cancelMeasure();
+    if (micRecorder && micRecorder.state !== 'inactive') { try { micRecorder.stop(); } catch (e) {} }
     if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
-    btnStart.disabled = false; btnWalk.disabled = true; btnStop.disabled = true;
+    btnStart.disabled = false; btnWalk.disabled = true; btnStop.disabled = true; btnRir.disabled = true;
     btnWalk.textContent = '● START WALKABOUT'; btnWalk.classList.remove('on');
     statusEl.textContent = 'stopped — camera released. Banked data (if any) is still on this page until you reload.';
 });
