@@ -47,6 +47,7 @@
     <button id="btn-rir" disabled>≋ MEASURE ROOM (30s) · EXPERIMENTAL</button>
     <button id="btn-bundle" disabled>↓ DOWNLOAD BUNDLE</button>
     <button id="btn-upload" disabled>⇪ UPLOAD BUNDLE</button>
+    <button id="btn-probe" disabled>⚙ AGENT PROBE: OFF</button>
     <button id="btn-stop" disabled>■ STOP</button>
 </div>
 <div id="upload-result"></div>
@@ -87,6 +88,7 @@ var btnStart = document.getElementById('btn-start');
 var btnWalk = document.getElementById('btn-walk');
 var btnBundle = document.getElementById('btn-bundle');
 var btnStop = document.getElementById('btn-stop');
+var btnProbe = document.getElementById('btn-probe');
 var btnRir = document.getElementById('btn-rir');
 var btnUpload = document.getElementById('btn-upload');
 var uploadEl = document.getElementById('upload-result');
@@ -139,6 +141,8 @@ var prevLuma = null;
 /* walkabout banking */
 var walking = false, walkStart = 0, lastBankAt = 0;
 var bank = { frames: [], keyframes: [], rirMeasures: [] };
+/* probe dwells ride the bundle (assigned at build time; probeRuns is
+   hoisted with var so the reference resolves) */
 var sessionMeta = null;
 
 function setErr(msg) { errEl.textContent = msg || ''; }
@@ -260,6 +264,7 @@ function render(now) {
         lastBankAt = now;
         bankFrame(cols, rows, luma, SUBW, SUBH);
     }
+    if (probeOn) probeObserve(cols, rows, luma, SUBW, SUBH);
     updateStatus(tier, cols, rows);
 }
 
@@ -297,6 +302,200 @@ function bankFrame(cols, rows, luma, SUBW, SUBH) {
         } catch (e) { /* keyframe is best-effort */ }
     }
 }
+
+/* ---------------- v1.2: AGENT PROBE mode (BRIEF-PROBE-MODE.md) ---------
+   The inversion: the ASCII feed's reader can be an AGENT watching stats,
+   so the renderer may SWITCH MODES FREQUENTLY — resolution sweeps, ramp
+   changes, edge layer on/off, fps targets. Confusing for a human; pure
+   information for an agent: every mode dwell is an experiment, the
+   stats are the result, and the OPTIMAL OPERATING POINT becomes
+   something LEARNED per room instead of the three hand-set tiers
+   (which become starting values only). Default OFF; the human view
+   stays calm. Programmes are DATA (a list of mode dwells) so the fleet
+   ships new sweeps without redeploying — ?programme=<url> fetches one,
+   else the embedded default. One tap stops; probe runs announce
+   themselves in the status line.                                           */
+var probeOn = false, probeProgramme = null, probeIdx = 0;
+var probeDwell = null;      /* {mode, startedAt, stats{...}, samples[]} */
+var probeRuns = [];         /* banked into the bundle as probeDwells[]  */
+var DEFAULT_PROBE = {
+    name: 'default-v1',
+    dwellMs: 1500,
+    modes: [
+        { id: 'c48-f8',   cols: 48,  fps: 8  },
+        { id: 'c48-f30',  cols: 48,  fps: 30 },
+        { id: 'c64-f15',  cols: 64,  fps: 15 },
+        { id: 'c96-f8',   cols: 96,  fps: 8  },
+        { id: 'c96-f30',  cols: 96,  fps: 30 },
+        { id: 'c128-f8',  cols: 128, fps: 8  },
+        { id: 'c128-f15', cols: 128, fps: 15 },
+        { id: 'c64-f15-ne', cols: 64, fps: 15, edges: false },
+        { id: 'c128-f8-hc', cols: 128, fps: 8, contrast: 3.2 }
+    ]
+};
+function asciiEntropy(lines) {
+    /* Shannon entropy over the glyph histogram: how much shape
+       information this mode's frame actually carries */
+    var hist = {}, n = 0;
+    for (var i = 0; i < lines.length; i++) {
+        var L = lines[i];
+        for (var j = 0; j < L.length; j++) { hist[L[j]] = (hist[L[j]] || 0) + 1; n++; }
+    }
+    var H = 0;
+    for (var k in hist) { var p = hist[k] / n; H -= p * Math.log2(p); }
+    return H;
+}
+function asciiEdgeDensity(lines) {
+    var e = 0, n = 0;
+    for (var i = 0; i < lines.length; i++) {
+        var L = lines[i];
+        for (var j = 0; j < L.length; j++) {
+            if (L[j] === '-' || L[j] === '|' || L[j] === '/' || L[j] === '\\') e++;
+            n++;
+        }
+    }
+    return n ? e / n : 0;
+}
+function probeFrame(cols, rows, luma, SUBW, SUBH) {
+    /* the probe's own ASCII render (respects the dwell's mode), which
+       doubles as the sample + the stats substrate */
+    var lines = [];
+    var edges = probeDwell && probeDwell.mode.edges !== false;
+    var contrast = (probeDwell && probeDwell.mode.contrast) || 2.2;
+    for (var cy = 0; cy < rows; cy++) {
+        var line = '';
+        for (var cx = 0; cx < cols; cx++) {
+            var s = 0, gx = 0, gy = 0;
+            for (var sy = 0; sy < SUBH; sy++)
+                for (var sx = 0; sx < SUBW; sx++) {
+                    var v = luma[(cy * SUBH + sy) * cols * SUBW + cx * SUBW + sx];
+                    s += v;
+                    gx += (sx / SUBW - 0.5) * v; gy += (sy / SUBH - 0.5) * v;
+                }
+            var mean = s / (SUBW * SUBH);
+            var bright = Math.max(0, Math.min(255,
+                ((mean / 255 - 0.5) * contrast + 0.5) * 255));
+            var ch = ASCII_MAP[Math.floor((bright / 255) * (MAP_LEN - 1))];
+            if (edges && Math.hypot(gx, gy) > 900) {
+                var ang = Math.atan2(gy, gx) + Math.PI / 2;
+                var a = Math.abs(Math.sin(ang)), b2 = Math.abs(Math.cos(ang));
+                ch = a > 2.2 * b2 ? '-' : b2 > 2.2 * a ? '|' :
+                     (Math.sin(ang) * Math.cos(ang) > 0 ? '/' : '\\');
+            }
+            line += ch;
+        }
+        lines.push(line);
+    }
+    return lines;
+}
+function probeObserve(cols, rows, luma, SUBW, SUBH) {
+    if (!probeDwell) return;
+    var st = probeDwell.stats;
+    st.frames++;
+    var lines = probeFrame(cols, rows, luma, SUBW, SUBH);
+    var text = lines.join('\n');
+    st._lastText = text;
+    st._lastEntropy = asciiEntropy(lines);
+    st._lastEdges = asciiEdgeDensity(lines);
+    if (st._prevLuma) {
+        var d = 0, n = Math.min(st._prevLuma.length, luma.length);
+        for (var i = 0; i < n; i++) d += Math.abs(st._prevLuma[i] - luma[i]);
+        st._change = (st._change * st._changeN + d / n) / (++st._changeN);
+    }
+    st._prevLuma = luma;
+    if (st.samples.length < 2) st.samples.push(text);
+}
+function probeAdvance(now) {
+    if (!probeOn || !probeProgramme) return;
+    if (!probeDwell) { startDwell(0); return; }
+    if (now - probeDwell.startedAt >= probeProgramme.dwellMs) {
+        finishDwell();
+        probeIdx++;
+        if (probeIdx >= probeProgramme.modes.length) probeIdx = 0;
+        startDwell(probeIdx);
+    }
+}
+function startDwell(i) {
+    var m = probeProgramme.modes[i];
+    probeDwell = { mode: m, startedAt: performance.now(),
+        stats: { frames: 0, samples: [], _change: 0, _changeN: 0 } };
+    statusEl.textContent = 'PROBE · dwell ' + m.id + ' (cols ' + m.cols +
+        ', fps ' + m.fps + (m.edges === false ? ', edges OFF' : '') +
+        ') — agent view; stats bank per dwell';
+}
+function finishDwell() {
+    if (!probeDwell) return;
+    var st = probeDwell.stats;
+    var durS = (performance.now() - probeDwell.startedAt) / 1000;
+    probeRuns.push({
+        programme: probeProgramme.name,
+        mode: probeDwell.mode,
+        t: Date.now() - (walkStart || Date.now()),
+        measured: {
+            achievedFps: +(st.frames / durS).toFixed(1),
+            frameEntropy: +(st._lastEntropy || 0).toFixed(3),
+            edgeDensity: +(st._lastEdges || 0).toFixed(4),
+            interFrameChange: +st._change.toFixed(2),
+            bytesPerFrame: st._lastText ? st._lastText.length * 2 : 0,
+            motionScore: +motionScore.toFixed(3),
+            poseAvailable: poseLive
+        },
+        samples: st.samples
+    });
+    probeDwell = null;
+}
+btnProbe.onclick = function () {
+    if (!running) return;
+    probeOn = !probeOn;
+    btnProbe.textContent = '⚙ AGENT PROBE: ' + (probeOn ? 'ON' : 'OFF');
+    if (probeOn && !probeProgramme) {
+        var pu = new URLSearchParams(location.search).get('programme');
+        probeProgramme = DEFAULT_PROBE;
+        if (pu) fetch(pu).then(function (r) { return r.json(); })
+            .then(function (j) {
+                if (j && j.modes && j.modes.length) {
+                    probeProgramme = j; probeIdx = 0;
+                    statusEl.textContent = 'PROBE · programme "' + (j.name || pu) +
+                        '" loaded (' + j.modes.length + ' modes)';
+                }
+            }).catch(function () { /* embedded default stands */ });
+    }
+    if (probeOn) { probeIdx = 0; startDwell(0); }
+    else { finishDwell(); statusEl.textContent = 'probe off — ' + probeRuns.length +
+           ' dwells banked (in bundle as probeDwells)'; }
+};
+
+/* ?autoprobe=1: start camera, run the probe programme once, report the
+   banked dwell summary on the console (the E2E hook; also an unattended
+   mode: the fleet can drive sweeps with no thumbs) */
+(function autoprobe() {
+    if (new URLSearchParams(location.search).get('autoprobe') !== '1') return;
+    window.__skipOriAsk = true;
+    /* this IIFE runs BEFORE the button listeners register (it sits with
+       the probe engine, above them) -- defer the click one tick or it
+       fires into nothing */
+    setTimeout(function () { btnStart.click(); }, 100);
+    var waited = 0;
+    var iv = setInterval(function () {
+        waited += 500;
+        if (running && !btnProbe.disabled) {
+            clearInterval(iv);
+            btnProbe.click();
+            setTimeout(function () {
+                probeOn = false; finishDwell();
+                btnProbe.textContent = '⚙ AGENT PROBE: OFF';
+                console.log('AUTOPROBE_RESULT ' + JSON.stringify(
+                    probeRuns.map(function (r) {
+                        return { id: r.mode.id, m: r.measured,
+                                 sampleRows: r.samples.length ?
+                                     r.samples[0].split('\n').length : 0 };
+                    })));
+            }, 16500);
+        } else if (waited > 15000) { clearInterval(iv);
+            console.log('AUTOPROBE_RESULT camera never started | err: ' +
+                errEl.textContent + ' | status: ' + statusEl.textContent); }
+    }, 500);
+})();
 
 var statusTick = 0;
 function updateStatus(tier, cols, rows) {
@@ -402,7 +601,8 @@ function buildBundle() {
             driftNote: 'single device: mic and camera share the phone clock and the recorder starts inside the same walkabout (offsetMs = audio start minus session start); no cross-device drift term applies.' }
         : { present: false, reason: audioWhyOff || 'audio not recorded' };
     var b = { meta: meta, endedAt: new Date().toISOString(),
-              frames: bank.frames, keyframes: bank.keyframes, rirMeasures: bank.rirMeasures || [] };
+              frames: bank.frames, keyframes: bank.keyframes, rirMeasures: bank.rirMeasures || [],
+              probeDwells: (typeof probeRuns !== 'undefined' && probeRuns.length) ? probeRuns : undefined };
     if (audioData) b.audio = { mimeType: audioData.mimeType, base64: audioData.base64 };
     return b;
 }
@@ -531,6 +731,9 @@ btnUpload.addEventListener('click', function () {
 
 /* ---------------- controls ---------------- */
 function askOrientationPermission() {
+    if (window.__skipOriAsk) return Promise.resolve();  /* autoprobe only:
+        the sensor-permission ask pends forever without a user gesture
+        (headless E2E found it); real runs keep the ask */
     if (typeof DeviceOrientationEvent !== 'undefined' &&
         typeof DeviceOrientationEvent.requestPermission === 'function') {
         return DeviceOrientationEvent.requestPermission().then(function (r) {
@@ -566,6 +769,7 @@ btnStart.addEventListener('click', function () {
         tierSince = performance.now();
         lastFrameAt = 0; fpsWindowT = performance.now(); fpsWindowN = 0;
         btnStart.disabled = true; btnWalk.disabled = false; btnStop.disabled = false;
+        btnProbe.disabled = false;
         btnRir.disabled = !audioOn;
         requestAnimationFrame(render);
     }).catch(function (e) {
@@ -614,6 +818,8 @@ btnBundle.addEventListener('click', function () {
 
 btnStop.addEventListener('click', function () {
     running = false; walking = false;
+    if (probeOn) { probeOn = false; finishDwell();
+        btnProbe.textContent = '⚙ AGENT PROBE: OFF'; btnProbe.disabled = true; }
     if (measuring) cancelMeasure();
     if (micRecorder && micRecorder.state !== 'inactive') { try { micRecorder.stop(); } catch (e) {} }
     if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
