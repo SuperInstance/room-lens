@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>room-lens — ASCII room mapper (v1)</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; min-height: 100%; background: #050505; color: #c8ffc8;
+        font-family: 'Courier New', Courier, monospace; }
+    body { display: flex; flex-direction: column; align-items: stretch; }
+    header { padding: 10px 14px 4px; }
+    header h1 { font-size: 17px; color: #00ff66; letter-spacing: 1px; }
+    header p { font-size: 11px; color: #7d8a7d; margin-top: 2px; }
+    #stage { position: relative; width: 100%; display: flex; align-items: center; justify-content: center;
+        background: #000; min-height: 46vh; }
+    canvas { image-rendering: pixelated; max-width: 100%; max-height: 62vh; }
+    #status { padding: 8px 14px; font-size: 12px; line-height: 1.5; color: #9fe89f;
+        border-top: 1px solid #1d2b1d; border-bottom: 1px solid #1d2b1d; white-space: pre-wrap; word-break: break-word; }
+    #controls { display: flex; flex-wrap: wrap; gap: 10px; padding: 12px 14px; }
+    button { flex: 1 1 40%; min-height: 56px; font-family: inherit; font-size: 15px; font-weight: bold;
+        letter-spacing: 1px; border-radius: 10px; border: 1px solid #2e4d2e; background: #0d1f0d; color: #00ff66;
+        padding: 10px 8px; }
+    button:active { background: #174017; }
+    button:disabled { opacity: 0.35; }
+    #btn-stop { color: #ff6666; border-color: #4d2e2e; background: #1f0d0d; }
+    #btn-walk.on { background: #14532d; color: #bbf7d0; border-color: #22c55e; }
+    #err { padding: 0 14px 10px; font-size: 12px; color: #ff8888; }
+    footer { padding: 4px 14px 16px; font-size: 11px; color: #5c6b5c; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<header>
+    <h1>ROOM-LENS v1</h1>
+    <p>Live ASCII room mapper. Renderer lifted from SuperInstance/chiaroscuro (Mirror door + Sobel shape layer). Adaptive fidelity: still = finer grid, moving = faster/coarser. Walkabout banks ASCII frames + pose stamps for the splat lane.</p>
+</header>
+
+<div id="stage"><canvas id="ascii-canvas"></canvas></div>
+<div id="status">idle — tap START CAMERA. Nothing is sent anywhere; everything stays on this phone until you download a bundle.</div>
+
+<div id="controls">
+    <button id="btn-start">▶ START CAMERA</button>
+    <button id="btn-walk" disabled>● START WALKABOUT</button>
+    <button id="btn-bundle" disabled>↓ DOWNLOAD BUNDLE</button>
+    <button id="btn-stop" disabled>■ STOP</button>
+</div>
+<div id="err"></div>
+
+<footer>
+    Honest status only: the line above reports measured fps, grid tier and banked frames — no fake progress.
+    Bundle = one JSON file: timestamped ASCII frames, device-orientation pose stamps, and a JPEG keyframe every 5th frame.
+</footer>
+
+<script>
+'use strict';
+/* =====================================================================
+   room-lens v1 — capture core lifted from chiaroscuro/mirror.html:
+   buffer-canvas downscale -> per-pixel luminance (0.299/0.587/0.114) ->
+   contrast stretch -> density ramp glyph, drawn in source colour.
+   Shape layer adapted from chiaroscuro/js/sobel_shape.js: per-cell
+   gradient descriptor; strong edges elect an orientation glyph
+   (- | / \) instead of a density glyph ("characters are shapes").
+   Changes vs the Mirror door: rear camera by default (rooms, not
+   selfies), character-aspect-corrected row count (a map should not
+   squash the room), adaptive fidelity tiers, walkabout banking.
+   ===================================================================== */
+
+var ASCII_MAP = " .:-=+*#%@@@@@@@@";
+var MAP_LEN = ASCII_MAP.length;
+var CHAR_ASPECT = 0.55; // monospace glyph width/height
+
+var video = document.createElement('video');
+video.playsInline = true; video.autoplay = true; video.muted = true;
+var buf = document.createElement('canvas');
+var bctx = buf.getContext('2d', { willReadFrequently: true });
+var out = document.getElementById('ascii-canvas');
+var octx = out.getContext('2d');
+var statusEl = document.getElementById('status');
+var errEl = document.getElementById('err');
+var btnStart = document.getElementById('btn-start');
+var btnWalk = document.getElementById('btn-walk');
+var btnBundle = document.getElementById('btn-bundle');
+var btnStop = document.getElementById('btn-stop');
+
+/* ---------------- adaptive fidelity tiers ----------------
+   still  -> finer grid, low fps (detail harvest)
+   slow   -> middle
+   moving -> coarser grid, high fps (temporal resolution)   */
+var TIERS = [
+    { name: 'STILL',  cols: 128, fps: 8  },
+    { name: 'SLOW',   cols: 96,  fps: 15 },
+    { name: 'MOVING', cols: 64,  fps: 30 }
+];
+var tierIdx = 1;               // start SLOW
+var tierSince = performance.now();
+
+/* motion score 0..1 from sensors when present, else frame-diff */
+var motionScore = 0;
+var lastOri = null, oriRate = 0, lastOriT = 0;
+var accelDev = 0;
+window.addEventListener('deviceorientation', function (e) {
+    var now = performance.now();
+    if (lastOri && e.alpha !== null) {
+        var d = Math.abs(e.alpha - lastOri.a) + Math.abs(e.beta - lastOri.b) + Math.abs(e.gamma - lastOri.g);
+        if (d > 180) d = 360 - d % 360;
+        oriRate = 0.8 * oriRate + 0.2 * Math.min(1, d / 25);
+        lastOriT = now;
+    }
+    if (e.alpha !== null) lastOri = { a: e.alpha, b: e.beta, g: e.gamma };
+    latestPose = { alpha: e.alpha, beta: e.beta, gamma: e.gamma,
+                   heading: (typeof e.webkitCompassHeading === 'number') ? e.webkitCompassHeading : null,
+                   t: Date.now() };
+    poseLive = true;
+});
+window.addEventListener('devicemotion', function (e) {
+    var a = e.accelerationIncludingGravity;
+    if (!a || a.x === null) return;
+    var mag = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+    accelDev = 0.85 * accelDev + 0.15 * Math.min(1, Math.abs(mag - 9.81) / 4);
+});
+var latestPose = null, poseLive = false;
+
+/* ---------------- state ---------------- */
+var running = false, stream = null;
+var framesRendered = 0, fpsMeasured = 0, fpsWindowT = performance.now(), fpsWindowN = 0;
+var lastFrameAt = 0;
+var prevLuma = null;
+
+/* walkabout banking */
+var walking = false, walkStart = 0, lastBankAt = 0;
+var bank = { frames: [], keyframes: [] };
+var sessionMeta = null;
+
+function setErr(msg) { errEl.textContent = msg || ''; }
+
+function tierFromMotion() {
+    if (motionScore < 0.12) return 0;
+    if (motionScore < 0.45) return 1;
+    return 2;
+}
+
+function render(now) {
+    if (!running) return;
+    requestAnimationFrame(render);
+    var tier = TIERS[tierIdx];
+    var minDelta = 1000 / tier.fps;
+    if (now - lastFrameAt < minDelta) return;
+    lastFrameAt = now;
+
+    var cols = tier.cols;
+    var aspect = video.videoWidth / video.videoHeight;
+    if (!aspect || !isFinite(aspect)) return;
+    var rows = Math.max(8, Math.floor(cols / aspect * CHAR_ASPECT));
+
+    /* subpixel field: 2 x 3 subpixels per cell (sobel_shape uses 4x6;
+       2x3 keeps a phone GPU/CPU comfortable at 128 cols) */
+    var SUBW = 2, SUBH = 3;
+    var sw = cols * SUBW, sh = rows * SUBH;
+    buf.width = sw; buf.height = sh;
+    bctx.drawImage(video, 0, 0, sw, sh);
+    var px = bctx.getImageData(0, 0, sw, sh).data;
+
+    /* luma field */
+    var luma = new Float32Array(sw * sh);
+    for (var i = 0, j = 0; i < px.length; i += 4, j++) {
+        luma[j] = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+    }
+
+    /* frame-diff fallback motion (when no motion sensors report) */
+    if (!poseLive && prevLuma && prevLuma.length === luma.length) {
+        var diff = 0, n = 0;
+        for (var k = 0; k < luma.length; k += 16) { diff += Math.abs(luma[k] - prevLuma[k]); n++; }
+        var fd = Math.min(1, (diff / n) / 28);
+        motionScore = 0.9 * motionScore + 0.1 * fd;
+    }
+    prevLuma = luma;
+    if (poseLive || accelDev > 0) {
+        motionScore = 0.92 * motionScore + 0.08 * Math.max(oriRate, accelDev);
+        oriRate *= 0.9;
+    }
+
+    /* tier switching with hysteresis (~1.2 s in the candidate tier) */
+    var want = tierFromMotion();
+    if (want !== tierIdx && now - tierSince > 1200) { tierIdx = want; tierSince = now; }
+
+    /* draw cells */
+    var fontH = Math.max(6, Math.floor(Math.min(window.innerHeight * 0.62, 560) / rows));
+    var fontW = fontH * CHAR_ASPECT + 2;
+    out.width = Math.floor(cols * fontW);
+    out.height = Math.floor(rows * fontH);
+    octx.fillStyle = '#050505';
+    octx.fillRect(0, 0, out.width, out.height);
+    octx.font = 'bold ' + fontH + 'px "Courier New", monospace';
+    octx.textBaseline = 'top';
+
+    var CONTRAST = 2.2; // chiaroscuro contrast-stretch, fixed for v1
+    for (var cy = 0; cy < rows; cy++) {
+        for (var cx = 0; cx < cols; cx++) {
+            /* cell subpixel stats: mean luma, gradient via column/row means */
+            var x0 = cx * SUBW, y0 = cy * SUBH;
+            var sum = 0, left = 0, right = 0, top = 0, bot = 0;
+            var rSum = 0, gSum = 0, bSum = 0;
+            for (var sy = 0; sy < SUBH; sy++) {
+                for (var sx = 0; sx < SUBW; sx++) {
+                    var idx = (y0 + sy) * sw + (x0 + sx);
+                    var v = luma[idx];
+                    sum += v;
+                    if (sx === 0) left += v; else right += v;
+                    if (sy === 0) top += v; else if (sy === SUBH - 1) bot += v;
+                    var pi = idx * 4;
+                    rSum += px[pi]; gSum += px[pi + 1]; bSum += px[pi + 2];
+                }
+            }
+            var nSub = SUBW * SUBH;
+            var mean = sum / nSub;
+            var gx = (right - left) / SUBW;         // gradient across cell
+            var gy = (bot - top) / (SUBH - 1 || 1);
+            var gmag = Math.sqrt(gx * gx + gy * gy);
+
+            var ch;
+            if (gmag > 46) {
+                /* orientation-gated election (sobel_shape): edge glyph.
+                   edge direction is perpendicular to the gradient. */
+                var ang = Math.atan2(gy, gx); // gradient direction
+                var edge = ang + Math.PI / 2; // edge direction
+                var a = Math.abs(Math.sin(edge)), b2 = Math.abs(Math.cos(edge));
+                if (a > 2.2 * b2) ch = '-';            // edge ~horizontal
+                else if (b2 > 2.2 * a) ch = '|';      // edge ~vertical
+                else ch = (Math.sin(edge) * Math.cos(edge) > 0) ? '/' : '\\';
+            } else {
+                var bright = ((mean / 255 - 0.5) * CONTRAST + 0.5) * 255;
+                bright = Math.max(0, Math.min(255, bright));
+                ch = ASCII_MAP[Math.floor((bright / 255) * (MAP_LEN - 1))];
+            }
+            if (ch === ' ') continue;
+            octx.fillStyle = 'rgb(' + (rSum / nSub | 0) + ',' + (gSum / nSub | 0) + ',' + (bSum / nSub | 0) + ')';
+            octx.fillText(ch, cx * fontW, cy * fontH);
+        }
+    }
+
+    framesRendered++;
+    fpsWindowN++;
+    if (now - fpsWindowT >= 1000) {
+        fpsMeasured = fpsWindowN * 1000 / (now - fpsWindowT);
+        fpsWindowN = 0; fpsWindowT = now;
+    }
+
+    /* banking */
+    if (walking && now - lastBankAt >= 400) {
+        lastBankAt = now;
+        bankFrame(cols, rows, luma, SUBW, SUBH);
+    }
+    updateStatus(tier, cols, rows);
+}
+
+function bankFrame(cols, rows, luma, SUBW, SUBH) {
+    /* re-render the banked ASCII as text using density ramp only
+       (the score the splat lane consumes: small, diffable) */
+    var lines = [];
+    for (var cy = 0; cy < rows; cy++) {
+        var line = '';
+        for (var cx = 0; cx < cols; cx++) {
+            var s = 0;
+            for (var sy = 0; sy < SUBH; sy++)
+                for (var sx = 0; sx < SUBW; sx++)
+                    s += luma[(cy * SUBH + sy) * cols * SUBW + cx * SUBW + sx];
+            var mean = s / (SUBW * SUBH);
+            var bright = Math.max(0, Math.min(255, ((mean / 255 - 0.5) * 2.2 + 0.5) * 255));
+            line += ASCII_MAP[Math.floor((bright / 255) * (MAP_LEN - 1))];
+        }
+        lines.push(line);
+    }
+    var t = Date.now() - walkStart;
+    var rec = { t: t, tier: TIERS[tierIdx].name, cols: cols, rows: rows,
+                pose: latestPose ? { alpha: latestPose.alpha, beta: latestPose.beta,
+                                     gamma: latestPose.gamma, heading: latestPose.heading } : null,
+                ascii: lines.join('\n') };
+    bank.frames.push(rec);
+    if (bank.frames.length % 5 === 1) {
+        /* JPEG keyframe for the splat lane */
+        try {
+            var kc = document.createElement('canvas');
+            var kw = 320, kh = Math.round(320 * video.videoHeight / video.videoWidth);
+            kc.width = kw; kc.height = kh;
+            kc.getContext('2d').drawImage(video, 0, 0, kw, kh);
+            bank.keyframes.push({ t: t, pose: rec.pose, jpeg: kc.toDataURL('image/jpeg', 0.6) });
+        } catch (e) { /* keyframe is best-effort */ }
+    }
+}
+
+var statusTick = 0;
+function updateStatus(tier, cols, rows) {
+    var now = performance.now();
+    if (now - statusTick < 500) return;
+    statusTick = now;
+    var poseTxt = poseLive ? 'pose: live' : 'pose: none (frames only)';
+    var walkTxt = walking ? (' · WALKABOUT banking: ' + bank.frames.length + ' frames, ' +
+                             bank.keyframes.length + ' keyframes, ' +
+                             Math.round((Date.now() - walkStart) / 1000) + 's') : '';
+    statusEl.textContent = 'LIVE · ' + fpsMeasured.toFixed(1) + ' fps · tier ' + tier.name +
+        ' · grid ' + cols + 'x' + rows + ' · motion ' + motionScore.toFixed(2) +
+        ' · ' + poseTxt + walkTxt;
+}
+
+/* ---------------- controls ---------------- */
+function askOrientationPermission() {
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+        return DeviceOrientationEvent.requestPermission().then(function (r) {
+            if (r !== 'granted') setErr('Orientation permission denied — pose stamps unavailable, frames will still bank.');
+        }).catch(function () { /* non-fatal */ });
+    }
+    return Promise.resolve();
+}
+
+btnStart.addEventListener('click', function () {
+    setErr('');
+    askOrientationPermission().then(function () {
+        return navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: 'environment' },
+                     width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false
+        });
+    }).then(function (s) {
+        stream = s;
+        video.srcObject = s;
+        return video.play();
+    }).then(function () {
+        running = true;
+        tierSince = performance.now();
+        lastFrameAt = 0; fpsWindowT = performance.now(); fpsWindowN = 0;
+        btnStart.disabled = true; btnWalk.disabled = false; btnStop.disabled = false;
+        requestAnimationFrame(render);
+    }).catch(function (e) {
+        setErr('Camera failed: ' + e.name + ' — ' + e.message + ' (needs HTTPS + camera permission).');
+        statusEl.textContent = 'idle — camera not started.';
+    });
+});
+
+btnWalk.addEventListener('click', function () {
+    if (!walking) {
+        walking = true; walkStart = Date.now(); lastBankAt = 0;
+        bank = { frames: [], keyframes: [] };
+        sessionMeta = { kind: 'room-lens-session', version: 1,
+                        startedAt: new Date(walkStart).toISOString(),
+                        userAgent: navigator.userAgent };
+        btnWalk.textContent = '■ STOP WALKABOUT';
+        btnWalk.classList.add('on');
+        btnBundle.disabled = true;
+    } else {
+        walking = false;
+        btnWalk.textContent = '● START WALKABOUT';
+        btnWalk.classList.remove('on');
+        btnBundle.disabled = bank.frames.length === 0;
+        statusEl.textContent = 'walkabout stopped — ' + bank.frames.length + ' frames banked. Tap DOWNLOAD BUNDLE to save the session file.';
+    }
+});
+
+btnBundle.addEventListener('click', function () {
+    var bundle = { meta: sessionMeta, endedAt: new Date().toISOString(),
+                   frames: bank.frames, keyframes: bank.keyframes };
+    var blob = new Blob([JSON.stringify(bundle)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'roomlens-session-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+});
+
+btnStop.addEventListener('click', function () {
+    running = false; walking = false;
+    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+    btnStart.disabled = false; btnWalk.disabled = true; btnStop.disabled = true;
+    btnWalk.textContent = '● START WALKABOUT'; btnWalk.classList.remove('on');
+    statusEl.textContent = 'stopped — camera released. Banked data (if any) is still on this page until you reload.';
+});
+</script>
+</body>
+</html>
