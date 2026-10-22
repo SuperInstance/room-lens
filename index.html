@@ -523,6 +523,8 @@ function audioSelfTest() {
                             console.log('AUDIO_SELF_TEST ' + JSON.stringify({
                                 audioPresent: b.meta.audio.present,
                                 audioParts: b.meta.audio.parts || 0,
+                                partKB: (b.audioParts || []).map(function (q) {
+                                    return Math.round(q.base64.length * 3 / 4 / 1024); }),
                                 rirMeasures: (b.rirMeasures || []).length,
                                 ambientBytes: b.meta.audio.totalBytes || 0,
                                 frames: b.frames.length
@@ -722,8 +724,13 @@ btnRir.addEventListener('click', function () {
     var restartAmbient = function () {
         if (ambientWas) { micChunks = []; startMicRecorder(); }
     };
-    if (ambientWas) { stopMicRecorder(true); micChunks = []; }
-    measureChunks = [];
+    /* AWAIT the bank: clearing micChunks synchronously after
+       stopMicRecorder raced the async onstop blob build -- dual-3's
+       parts banked with empty/broken bytes (found from the take, in the
+       code). Chain the clear+measure through the promise. */
+    var begin = function () { measureChunks = []; };
+    (ambientWas ? stopMicRecorder(true) : Promise.resolve())
+        .then(begin, begin);
     var mt = pickMime();
     try {
         measureRec = mt ? new MediaRecorder(new MediaStream(stream.getAudioTracks()), { mimeType: mt })
