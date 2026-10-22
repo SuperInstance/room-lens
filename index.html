@@ -523,7 +523,12 @@ function updateStatus(tier, cols, rows) {
    carries the start timestamp + offset + drift note for the splat lane. */
 var audioOn = false, audioWhyOff = '';
 var micRecorder = null, micChunks = [], micMime = '', audioBytes = 0, audioStartT = 0;
-var audioData = null; /* { mimeType, base64, bytes, startedAt, offsetMs } after a walkabout */
+var audioData = null;
+/* audioParts: a walkabout interrupted by MEASURE ROOM records in PARTS
+   (each measure evicts the ambient recorder on browsers that allow one
+   MediaRecorder per track -- found in the dual-1 take, in the code);
+   every part banks, the bundle says where the gaps are */
+var audioParts = [];
 
 function pickMime() {
     var cands = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', ''];
@@ -561,19 +566,30 @@ function startMicRecorder() {
     } catch (e) { return false; }
 }
 
-function stopMicRecorder() {
+function stopMicRecorder(interrupted) {
     return new Promise(function (resolve) {
-        if (!micRecorder || micRecorder.state === 'inactive') { resolve(null); return; }
-        micRecorder.onstop = function () {
+        var inactive = !micRecorder || micRecorder.state === 'inactive';
+        /* SALVAGE: an evicted recorder is 'inactive' but its chunks are
+           ours -- bank them as a part instead of discarding (the dual-1
+           defect: ambient audio present=false while chunks sat in
+           micChunks) */
+        if (inactive && (!micChunks || !micChunks.length)) { resolve(null); return; }
+        var finish = function () {
+            if (!micChunks || !micChunks.length) { resolve(null); return; }
             var blob = new Blob(micChunks, { type: micMime || 'audio/webm' });
             blobToBase64(blob).then(function (b64) {
-                audioData = { mimeType: blob.type, base64: b64, bytes: blob.size,
-                              startedAt: new Date(audioStartT).toISOString(),
-                              offsetMs: audioStartT - walkStart };
-                resolve(audioData);
+                var part = { mimeType: blob.type, base64: b64, bytes: blob.size,
+                             startedAt: new Date(audioStartT).toISOString(),
+                             offsetMs: audioStartT - walkStart,
+                             interrupted: !!interrupted };
+                audioParts.push(part);
+                audioData = part;   /* last part also serves as legacy audioData */
+                resolve(part);
             }).catch(function () { resolve(null); });
         };
-        try { micRecorder.stop(); } catch (e) { resolve(null); }
+        if (inactive) { finish(); return; }
+        micRecorder.onstop = finish;
+        try { micRecorder.stop(); } catch (e) { finish(); }
     });
 }
 
@@ -595,15 +611,26 @@ function buildBundle() {
     ensureSession(false);
     var meta = {};
     for (var k in sessionMeta) meta[k] = sessionMeta[k];
-    meta.audio = audioData
-        ? { present: true, startedAt: audioData.startedAt, offsetMs: audioData.offsetMs,
-            mimeType: audioData.mimeType, bytes: audioData.bytes,
-            driftNote: 'single device: mic and camera share the phone clock and the recorder starts inside the same walkabout (offsetMs = audio start minus session start); no cross-device drift term applies.' }
+    meta.audio = audioParts.length
+        ? { present: true, parts: audioParts.length,
+            startedAt: audioParts[0].startedAt,
+            totalBytes: audioParts.reduce(function (a, p) { return a + p.bytes; }, 0),
+            note: audioParts.length > 1
+                ? audioParts.length + ' parts: MEASURE ROOM interrupts bank ' +
+                  'as parts (each part carries startedAt/offsetMs; the gaps ' +
+                  'are the measures themselves)'
+                : 'single device: mic and camera share the phone clock and the recorder starts inside the same walkabout (offsetMs = audio start minus session start); no cross-device drift term applies.' }
         : { present: false, reason: audioWhyOff || 'audio not recorded' };
     var b = { meta: meta, endedAt: new Date().toISOString(),
               frames: bank.frames, keyframes: bank.keyframes, rirMeasures: bank.rirMeasures || [],
               probeDwells: (typeof probeRuns !== 'undefined' && probeRuns.length) ? probeRuns : undefined };
-    if (audioData) b.audio = { mimeType: audioData.mimeType, base64: audioData.base64 };
+    if (audioParts.length === 1)
+        b.audio = { mimeType: audioParts[0].mimeType, base64: audioParts[0].base64 };
+    else if (audioParts.length > 1)
+        b.audioParts = audioParts.map(function (p) {
+            return { mimeType: p.mimeType, base64: p.base64,
+                     startedAt: p.startedAt, offsetMs: p.offsetMs,
+                     interrupted: p.interrupted }; });
     return b;
 }
 
@@ -646,6 +673,15 @@ btnRir.addEventListener('click', function () {
         var env = Math.min(1, Math.min(i, len - i) / fade);
         chd[i] = env * Math.sin(ph);
     }
+    /* SERIALIZE, don't stack: stop the ambient recorder FIRST (banking
+       its part), run the measure alone, restart ambient after -- two
+       MediaRecorders on one audio track evict each other on some
+       browsers (the dual-1 defect, found in the code) */
+    var ambientWas = micRecorder && micRecorder.state === 'recording';
+    var restartAmbient = function () {
+        if (ambientWas) { micChunks = []; startMicRecorder(); }
+    };
+    if (ambientWas) { stopMicRecorder(true); micChunks = []; }
     measureChunks = [];
     var mt = pickMime();
     try {
@@ -664,6 +700,7 @@ btnRir.addEventListener('click', function () {
         if (measureTickInt) { clearInterval(measureTickInt); measureTickInt = null; }
         if (measureCtx) { try { measureCtx.close(); } catch (e) {} measureCtx = null; }
         measuring = false; btnRir.classList.remove('on'); btnRir.disabled = !audioOn;
+        restartAmbient();
         if (measureCancel) { statusEl.textContent = 'room measure cancelled — nothing banked.'; return; }
         var blob = new Blob(measureChunks, { type: recMime });
         blobToBase64(blob).then(function (b64) {
@@ -780,7 +817,7 @@ btnStart.addEventListener('click', function () {
 
 btnWalk.addEventListener('click', function () {
     if (!walking) {
-        walking = true; walkStart = Date.now(); lastBankAt = 0;
+        walking = true; walkStart = Date.now(); lastBankAt = 0; audioParts = [];
         bank = { frames: [], keyframes: [], rirMeasures: bank.rirMeasures || [] };
         audioData = null;
         ensureSession(true);
