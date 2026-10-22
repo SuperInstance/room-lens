@@ -763,6 +763,15 @@ btnRir.addEventListener('click', function () {
         });
     };
     measureRec.start(500);
+    /* TAKE-2: beacon the chirp to the liaison -- the witness answers
+       through the bench speakers (two-way ranging, clock-free sync) */
+    try {
+        navigator.sendBeacon('/log', JSON.stringify({
+            kind: 'PHONE_CHIRP', page: 'room-lens',
+            ts: new Date().toISOString(), phone: 'room-lens',
+            sweep: { f0: f0, f1: f1, sweepS: sweepS, gain: gainLvl },
+            gain: gainLvl }));
+    } catch (e) { /* best effort */ }
     setTimeout(function () {
         if (measureCancel || !measureCtx) return;
         measureSrc = measureCtx.createBufferSource();
