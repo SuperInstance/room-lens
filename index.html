@@ -469,7 +469,9 @@ btnProbe.onclick = function () {
    banked dwell summary on the console (the E2E hook; also an unattended
    mode: the fleet can drive sweeps with no thumbs) */
 (function autoprobe() {
-    if (new URLSearchParams(location.search).get('autoprobe') !== '1') return;
+    var mode = new URLSearchParams(location.search).get('autoprobe');
+    if (!mode) return;
+    if (mode === 'audioselftest') { audioSelfTest(); return; }
     window.__skipOriAsk = true;
     /* this IIFE runs BEFORE the button listeners register (it sits with
        the probe engine, above them) -- defer the click one tick or it
@@ -496,6 +498,45 @@ btnProbe.onclick = function () {
                 errEl.textContent + ' | status: ' + statusEl.textContent); }
     }, 500);
 })();
+
+/* ?autoprobe=audioselftest: the regression test for the dual-1 defect --
+   camera -> WALKABOUT (ambient recorder ON) -> MEASURE ROOM mid-walk
+   (the eviction trigger) -> stop -> report whether meta.audio.present
+   is TRUE with a rirMeasure coexisting. Fake devices are fine; Casey
+   does not perform for tests. */
+function audioSelfTest() {
+    window.__skipOriAsk = true;
+    setTimeout(function () {
+        btnStart.click();
+        var waited = 0;
+        var iv = setInterval(function () {
+            waited += 500;
+            if (running && !btnWalk.disabled) {
+                clearInterval(iv);
+                btnWalk.click();                      // ambient ON
+                setTimeout(function () {
+                    btnRir.click();                   // the eviction trigger
+                    setTimeout(function () {
+                        btnStop.click();              // end everything
+                        setTimeout(function () {
+                            var b = buildBundle();
+                            console.log('AUDIO_SELF_TEST ' + JSON.stringify({
+                                audioPresent: b.meta.audio.present,
+                                audioParts: b.meta.audio.parts || 0,
+                                rirMeasures: (b.rirMeasures || []).length,
+                                ambientBytes: b.meta.audio.totalBytes || 0,
+                                frames: b.frames.length
+                            }));
+                        }, 3000);
+                    }, 30000);                        // one 24s measure + margin
+                }, 3000);
+            } else if (waited > 20000) {
+                clearInterval(iv);
+                console.log('AUDIO_SELF_TEST camera never started');
+            }
+        }, 500);
+    }, 100);
+}
 
 var statusTick = 0;
 function updateStatus(tier, cols, rows) {
@@ -858,8 +899,14 @@ btnStop.addEventListener('click', function () {
     if (probeOn) { probeOn = false; finishDwell();
         btnProbe.textContent = '⚙ AGENT PROBE: OFF'; btnProbe.disabled = true; }
     if (measuring) cancelMeasure();
-    if (micRecorder && micRecorder.state !== 'inactive') { try { micRecorder.stop(); } catch (e) {} }
-    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+    /* BANK FIRST, then release: the raw .stop() here never went through
+       stopMicRecorder, so the final ambient part died unbanked (the
+       self-test caught it: parts=1 when an interrupted take owes 2) */
+    var release = function () {
+        if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+    };
+    if (walking || audioOn) stopMicRecorder().then(release, release);
+    else release();
     btnStart.disabled = false; btnWalk.disabled = true; btnStop.disabled = true; btnRir.disabled = true;
     btnWalk.textContent = '● START WALKABOUT'; btnWalk.classList.remove('on');
     statusEl.textContent = 'stopped — camera released. Banked data (if any) is still on this page until you reload.';
